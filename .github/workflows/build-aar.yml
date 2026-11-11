@@ -84,12 +84,13 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.19.34-android.1-fix1
-          name: v1.19.34-android.1-fix1 (HevFix)
+          tag_name: v1.19.34-android.1-fix2
+          name: v1.19.34-android.1-fix2 (HevFix)
           body: |
             Patched libclash.aar for AsteriskMETA Hev TUN process attribution.
-            - go/native/delegate/init.go: fall back to metadata address fields when
-              raw socket addresses are nil (SOCKS inbound), so UID lookup works for
-              connections forwarded by the patched hev-socks5-tunnel.
+            - go/native/delegate/init.go: rebuild the socket tuple from metadata when
+              raw addresses are missing (SOCKS inbound), including the case where the
+              sniffer cleared DstIP, so UID lookup works for connections forwarded by
+              the patched hev-socks5-tunnel.
           files: |
             libclash.aar

@@ -1,42 +1,139 @@
 diff -ruN a/go/native/delegate/init.go b/go/native/delegate/init.go
---- a/go/native/delegate/init.go	2026-11-11 19:49:23.562940000 +0800
-+++ b/go/native/delegate/init.go	2026-11-11 19:50:03.890748500 +0800
-@@ -5,6 +5,7 @@
+--- a/go/native/delegate/init.go	2026-11-12 00:07:32.327110500 +0800
++++ b/go/native/delegate/init.go	2026-11-12 00:07:59.976767800 +0800
+@@ -4,10 +4,15 @@
+ package delegate
  
  import (
++	"context"
  	"errors"
 +	"net"
++	"net/netip"
  	"syscall"
++	"time"
  
  	"github.com/metacubex/mihomo/component/process"
-@@ -29,10 +30,28 @@
- 		src, dst := metadata.RawSrcAddr, metadata.RawDstAddr
++	"github.com/metacubex/mihomo/component/resolver"
+ 	"github.com/metacubex/mihomo/log"
  
- 		if src == nil || dst == nil {
+ 	"cfa/native/app"
+@@ -19,34 +24,107 @@
+ 
+ var errBlocked = errors.New("blocked")
+ 
++// ownerLookupTimeout bounds the extra DNS work done to rebuild a destination
++// tuple. The answer is normally already cached, since the app resolved the same
++// name through this core moments earlier.
++const ownerLookupTimeout = 2 * time.Second
++
+ func Init(home, versionName string, platformVersion int) {
+ 	log.Infoln("Init core, home: %s, versionName: %s, core: %s, platformVersion: %d", home, versionName, constant.Version, platformVersion)
+ 	constant.SetHomeDir(home)
+ 	app.ApplyVersionName(versionName)
+ 	app.ApplyPlatformVersion(platformVersion)
+ 
+-	process.DefaultPackageNameResolver = func(metadata *constant.Metadata) (string, error) {
+-		src, dst := metadata.RawSrcAddr, metadata.RawDstAddr
++	process.DefaultPackageNameResolver = resolvePackageName
+ 
+-		if src == nil || dst == nil {
 -			return "", process.ErrInvalidNetwork
-+			// SOCKS inbounds (Hev TUN mode) carry no raw socket addresses.
-+			// Rebuild the tuple from metadata fields instead: the source port
-+			// is preserved from the original app flow by the patched tunnel,
-+			// so the app-side lookup can recover the owning UID.
-+			if !metadata.SourceValid() || !metadata.Resolved() {
-+				return "", process.ErrInvalidNetwork
-+			}
-+			srcAddrPort := metadata.SourceAddrPort()
-+			dstAddrPort := metadata.AddrPort()
-+			switch metadata.NetWork {
-+			case constant.UDP:
-+				src = net.UDPAddrFromAddrPort(srcAddrPort)
-+				dst = net.UDPAddrFromAddrPort(dstAddrPort)
-+			case constant.TCP:
-+				src = net.TCPAddrFromAddrPort(srcAddrPort)
-+				dst = net.TCPAddrFromAddrPort(dstAddrPort)
-+			default:
-+				return "", process.ErrInvalidNetwork
-+			}
++	dialer.DefaultSocketHook = func(network, address string, conn syscall.RawConn) error {
++		if platform.ShouldBlockConnection() {
++			return errBlocked
  		}
  
--		uid := app.QuerySocketUid(metadata.RawSrcAddr, metadata.RawDstAddr)
-+		uid := app.QuerySocketUid(src, dst)
++		return conn.Control(func(fd uintptr) {
++			app.MarkSocket(int(fd))
++		})
++	}
++}
++
++// resolvePackageName maps a connection back to the app that owns the socket.
++//
++// Native TUN inbounds hand over the real socket addresses (RawSrcAddr /
++// RawDstAddr). SOCKS inbounds - the path used by Hev TUN - do not: the tunnel
++// terminates the app flow and dials the core again from loopback, so only the
++// original source port survives (kept by the patched hev-socks5-tunnel) and the
++// destination has to be rebuilt from metadata.
++func resolvePackageName(metadata *constant.Metadata) (string, error) {
++	if metadata.RawSrcAddr != nil && metadata.RawDstAddr != nil {
+ 		uid := app.QuerySocketUid(metadata.RawSrcAddr, metadata.RawDstAddr)
  		pkg := app.QueryAppByUid(uid)
- 
+-
  		log.Debugln("[PKG] %s --> %s by %d[%s]", metadata.SourceAddress(), metadata.RemoteAddress(), uid, pkg)
+-
+ 		return pkg, nil
+ 	}
+ 
+-	dialer.DefaultSocketHook = func(network, address string, conn syscall.RawConn) error {
+-		if platform.ShouldBlockConnection() {
+-			return errBlocked
++	srcAddrPort := metadata.SourceAddrPort()
++	if !metadata.SourceValid() || !srcAddrPort.IsValid() || srcAddrPort.Port() == 0 {
++		return "", process.ErrInvalidNetwork
++	}
++
++	candidates := destinationCandidates(metadata)
++	if len(candidates) == 0 {
++		return "", process.ErrInvalidNetwork
++	}
++
++	for _, dstAddrPort := range candidates {
++		uid := app.QuerySocketUid(
++			metadataAddr(metadata.NetWork, srcAddrPort),
++			metadataAddr(metadata.NetWork, dstAddrPort),
++		)
++		if pkg := app.QueryAppByUid(uid); pkg != "" {
++			log.Debugln("[PKG] %s --> %s by %d[%s]", metadata.SourceAddress(), dstAddrPort.String(), uid, pkg)
++			return pkg, nil
+ 		}
++	}
+ 
+-		return conn.Control(func(fd uintptr) {
+-			app.MarkSocket(int(fd))
+-		})
++	log.Debugln("[PKG] %s --> %s: no owner (host %q, dstIP %v, dstPort %d)",
++		metadata.SourceAddress(), metadata.RemoteAddress(), metadata.Host, metadata.DstIP, metadata.DstPort)
++	return "", nil
++}
++
++// destinationCandidates returns every destination tuple the app socket may
++// hold. With sniffer override-destination the core clears DstIP and keeps only
++// the domain, so the name is resolved back to the addresses the app dialed.
++func destinationCandidates(metadata *constant.Metadata) []netip.AddrPort {
++	candidates := make([]netip.AddrPort, 0, 8)
++	if metadata.DstIP.IsValid() {
++		candidates = append(candidates, netip.AddrPortFrom(metadata.DstIP.Unmap(), metadata.DstPort))
++	}
++
++	if metadata.Host == "" || metadata.DstPort == 0 {
++		return candidates
++	}
++	if resolver.DefaultResolver == nil && resolver.SystemResolver == nil {
++		return candidates
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), ownerLookupTimeout)
++	defer cancel()
++	ips, err := resolver.LookupIP(ctx, metadata.Host)
++	if err != nil {
++		log.Debugln("[PKG] resolve %s for owner lookup failed: %s", metadata.Host, err.Error())
++		return candidates
++	}
++	for _, ip := range ips {
++		addrPort := netip.AddrPortFrom(ip.Unmap(), metadata.DstPort)
++		if len(candidates) > 0 && candidates[0] == addrPort {
++			continue
++		}
++		candidates = append(candidates, addrPort)
++	}
++	return candidates
++}
++
++func metadataAddr(netWork constant.NetWork, addrPort netip.AddrPort) net.Addr {
++	if netWork == constant.UDP {
++		return net.UDPAddrFromAddrPort(addrPort)
+ 	}
++	return net.TCPAddrFromAddrPort(addrPort)
+ }
