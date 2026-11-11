@@ -1,0 +1,42 @@
+diff -ruN a/go/native/delegate/init.go b/go/native/delegate/init.go
+--- a/go/native/delegate/init.go	2026-11-11 19:49:23.562940000 +0800
++++ b/go/native/delegate/init.go	2026-11-11 19:50:03.890748500 +0800
+@@ -5,6 +5,7 @@
+ 
+ import (
+ 	"errors"
++	"net"
+ 	"syscall"
+ 
+ 	"github.com/metacubex/mihomo/component/process"
+@@ -29,10 +30,28 @@
+ 		src, dst := metadata.RawSrcAddr, metadata.RawDstAddr
+ 
+ 		if src == nil || dst == nil {
+-			return "", process.ErrInvalidNetwork
++			// SOCKS inbounds (Hev TUN mode) carry no raw socket addresses.
++			// Rebuild the tuple from metadata fields instead: the source port
++			// is preserved from the original app flow by the patched tunnel,
++			// so the app-side lookup can recover the owning UID.
++			if !metadata.SourceValid() || !metadata.Resolved() {
++				return "", process.ErrInvalidNetwork
++			}
++			srcAddrPort := metadata.SourceAddrPort()
++			dstAddrPort := metadata.AddrPort()
++			switch metadata.NetWork {
++			case constant.UDP:
++				src = net.UDPAddrFromAddrPort(srcAddrPort)
++				dst = net.UDPAddrFromAddrPort(dstAddrPort)
++			case constant.TCP:
++				src = net.TCPAddrFromAddrPort(srcAddrPort)
++				dst = net.TCPAddrFromAddrPort(dstAddrPort)
++			default:
++				return "", process.ErrInvalidNetwork
++			}
+ 		}
+ 
+-		uid := app.QuerySocketUid(metadata.RawSrcAddr, metadata.RawDstAddr)
++		uid := app.QuerySocketUid(src, dst)
+ 		pkg := app.QueryAppByUid(uid)
+ 
+ 		log.Debugln("[PKG] %s --> %s by %d[%s]", metadata.SourceAddress(), metadata.RemoteAddress(), uid, pkg)
