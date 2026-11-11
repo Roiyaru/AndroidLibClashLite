@@ -68,8 +68,18 @@ jobs:
       - name: Build libclash.aar
         run: |
           set -euo pipefail
-          python3 upstream/scripts/build_go.py --arch arm64 --api 26 --output libclash.aar --work-dir build-work
+          python3 upstream/scripts/build_go.py --arch arm64 --api 26 --output libclash.aar --work-dir build-work 2>&1 | tee build.log
           ls -la libclash.aar
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci-logs
+          name: CI build logs
+          files: |
+            build.log
+            build-work/*.log
 
       - name: Create release
         uses: softprops/action-gh-release@v2
